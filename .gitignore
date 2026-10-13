@@ -1,4 +1,4 @@
-# Keep this repository limited to the core scraper and its runtime inputs.
+# Keep this repository limited to the core scraper, its tests, and runtime inputs.
 # Everything else (including .env, SSH keys, extra/, output/, browser-state/,
 # virtual environments, caches, and deployment helpers) stays local.
 /*
@@ -8,6 +8,10 @@
 !/models.py
 !/requirements.txt
 !/data/
+!/tests/
 
 /data/*
 !/data/nihongopro-grammar-index.json
+
+__pycache__/
+.pytest_cache/
