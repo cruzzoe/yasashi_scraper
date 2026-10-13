@@ -5,6 +5,7 @@
 !/.gitignore
 !/.env.example
 !/nhk_easy_scraper.py
+!/audio_alignment.py
 !/models.py
 !/requirements.txt
 !/data/

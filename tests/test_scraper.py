@@ -1,22 +1,18 @@
 import asyncio
 from types import SimpleNamespace
 
+import pytest
+
 from models import Enrichment
 from nhk_easy_scraper import (
-    AlignmentTarget,
     ARTICLE_LINK,
-    align_sentence_spans,
-    alignment_targets,
     capture_article_images,
     collect_images,
-    detected_speech_end,
+    enrich,
     grammar_candidates,
     grammar_key,
     safe_id,
-    sentence_timings,
-    split_html_sentences,
-    spoken_reading_from_html,
-    validate_final_cue_end,
+    run,
     validate_grammar_selections,
 )
 
@@ -27,6 +23,61 @@ LEAD_IMG = {
     "alt": "lead",
     "caption": "Caption",
 }
+
+
+@pytest.mark.parametrize("api_key", [None, "", "   "])
+def test_enrichment_requires_api_key_even_with_old_dummy_setting(monkeypatch, api_key):
+    if api_key is None:
+        monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    else:
+        monkeypatch.setenv("DEEPSEEK_API_KEY", api_key)
+    monkeypatch.setenv("SCRAPER_DUMMY_TRANSLATION", "true")
+
+    with pytest.raises(RuntimeError, match="DEEPSEEK_API_KEY is required"):
+        enrich([], [], [], "test-model")
+
+
+def test_missing_api_key_stops_run_before_browser_or_output_creation(monkeypatch, tmp_path):
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.setenv("SCRAPER_OUTPUT", str(tmp_path / "output"))
+
+    def unexpected_browser_start():
+        pytest.fail("Browser must not start without a DeepSeek API key")
+
+    monkeypatch.setattr("nhk_easy_scraper.async_playwright", unexpected_browser_start)
+    with pytest.raises(RuntimeError, match="DEEPSEEK_API_KEY is required"):
+        asyncio.run(run(SimpleNamespace(article_url=None, headed=False, no_publish=True)))
+
+    assert not (tmp_path / "output").exists()
+
+
+def test_enrichment_calls_deepseek_even_with_old_dummy_setting(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setenv("SCRAPER_DUMMY_TRANSLATION", "true")
+    payload = Enrichment.model_validate({
+        "translations": [{"paragraph_id": "p1", "english": "It rained."}],
+        "vocabulary": [
+            {"surface": f"語{i}", "reading": f"ご{i}", "meaning": f"word{i}", "paragraph_ids": ["p1"], "difficulty_rank": i, "distractors": ["a", "b", "c"]}
+            for i in range(1, 5)
+        ],
+    })
+    requests = []
+
+    def fake_create(**kwargs):
+        requests.append(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(
+            message=SimpleNamespace(content=payload.model_dump_json()),
+        )])
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=fake_create)))
+    monkeypatch.setattr("nhk_easy_scraper.OpenAI", lambda **kwargs: client)
+    paragraphs = [SimpleNamespace(id="p1", japanese_plain="雨が降りました。")]
+
+    result = enrich(paragraphs, [], [], "test-model")
+
+    assert result == payload
+    assert len(requests) == 1
+    assert requests[0]["model"] == "test-model"
 
 
 class FakeLocator:
@@ -136,118 +187,6 @@ def test_safe_id_uses_the_article_filename():
     assert safe_id(
         "https://news.web.nhk/news/easy/20260814de44051/20260814de44051.html"
     ) == "20260814de44051"
-
-
-def test_html_sentence_split_preserves_ruby():
-    fragments = split_html_sentences("<ruby>日本<rt>にほん</rt></ruby>です。次です。")
-    assert fragments == ["<ruby>日本<rt>にほん</rt></ruby>です。", "次です。"]
-
-
-def test_spoken_reading_uses_ruby_and_retains_plain_text():
-    assert spoken_reading_from_html("<ruby>八代市<rt>やつしろし</rt></ruby>では") == "やつしろしでは"
-
-
-def test_alignment_targets_include_surface_and_ruby_reading_keys():
-    paragraphs = [SimpleNamespace(
-        id="p1",
-        japanese_html="<ruby>八代市<rt>やつしろし</rt></ruby>です。",
-    )]
-
-    assert alignment_targets(paragraphs) == [AlignmentTarget(
-        paragraph_id="p1",
-        sentence_id="p1-s1",
-        japanese="八代市です。",
-        surface_key="八代市です",
-        reading_key="やつしろしです",
-    )]
-
-
-def test_global_alignment_does_not_give_next_sentence_prefix_to_previous_sentence():
-    words = [
-        SimpleNamespace(word="aaa", start=0.0, end=0.5),
-        SimpleNamespace(word="bbb", start=0.5, end=1.0),
-        SimpleNamespace(word="x", start=1.2, end=1.4),
-        SimpleNamespace(word="yz", start=1.4, end=1.8),
-    ]
-    targets = [
-        AlignmentTarget("p1", "p1-s1", "aaabbbx", "aaabbbx", "aaabbbx"),
-        AlignmentTarget("p1", "p1-s2", "xyz", "xyz", "xyz"),
-    ]
-
-    spans = align_sentence_spans(words, targets)
-
-    assert (spans[0].start_word, spans[0].end_word) == (0, 2)
-    assert (spans[1].start_word, spans[1].end_word) == (2, 4)
-
-
-def test_confident_sentence_cues_get_bounded_300ms_preroll():
-    words = [
-        SimpleNamespace(word="first", start=0.5, end=1.0),
-        SimpleNamespace(word="second", start=2.0, end=2.8),
-    ]
-    targets = [
-        AlignmentTarget("p1", "p1-s1", "first", "first", "first"),
-        AlignmentTarget("p1", "p1-s2", "second", "second", "second"),
-    ]
-
-    result = sentence_timings(words, targets)["p1"]
-
-    assert [(sentence.start, sentence.end) for sentence in result] == [(0.2, 1.7), (1.7, 2.8)]
-
-
-def test_missing_prefix_starts_at_previous_spoken_end_and_warns(capsys):
-    words = [
-        SimpleNamespace(word="first", start=0.2, end=1.0),
-        SimpleNamespace(word="cd", start=2.0, end=2.5),
-    ]
-    targets = [
-        AlignmentTarget("p1", "p1-s1", "first", "first", "first"),
-        AlignmentTarget("p1", "p1-s2", "abcd", "abcd", "abcd"),
-    ]
-
-    result = sentence_timings(words, targets)["p1"]
-
-    assert result[1].start == 1.0
-    assert "uncertain prefix" in capsys.readouterr().out
-
-
-def test_final_cue_extends_to_detected_trailing_speech(monkeypatch, tmp_path, capsys):
-    timings = {"p1": [
-        SimpleNamespace(id="p1-s1", start=0.0, end=2.0),
-        SimpleNamespace(id="p1-s2", start=2.0, end=58.43),
-    ]}
-    monkeypatch.setattr("nhk_easy_scraper.detected_speech_end", lambda _: 60.629)
-
-    validate_final_cue_end(tmp_path / "audio.mp3", timings)
-
-    assert timings["p1"][-1].end == 60.629
-    assert "extended final cue p1-s2" in capsys.readouterr().out
-
-
-def test_detected_speech_end_uses_terminal_silence_before_mp3_duration(monkeypatch, tmp_path):
-    def fake_run(command, **_kwargs):
-        if command[0] == "ffprobe":
-            return SimpleNamespace(returncode=0, stdout="60.672\n", stderr="")
-        return SimpleNamespace(
-            returncode=0,
-            stdout="",
-            stderr="silence_start: 59.3819\nsilence_end: 60.6293 | silence_duration: 1.2474\n",
-        )
-
-    monkeypatch.setattr("nhk_easy_scraper.shutil.which", lambda _: "/usr/bin/tool")
-    monkeypatch.setattr("nhk_easy_scraper.subprocess.run", fake_run)
-
-    assert detected_speech_end(tmp_path / "audio.mp3") == 59.3819
-
-
-def test_final_cue_is_unchanged_when_the_remaining_audio_is_short(monkeypatch, tmp_path):
-    final = SimpleNamespace(id="p1-s1", start=0.0, end=10.0)
-    timings = {"p1": [final]}
-    monkeypatch.setattr("nhk_easy_scraper.detected_speech_end", lambda _: 10.2)
-
-    validate_final_cue_end(tmp_path / "audio.mp3", timings)
-
-    assert final.end == 10.0
 
 
 def test_grammar_candidates_and_validation_are_grounded_in_source_text():
